@@ -50,8 +50,10 @@ impl Tensor {
     /// A contiguous CPU tensor holding `data` with shape `shape`.
     ///
     /// Errors when `data.len()` does not equal `shape.numel()`.
-    pub fn from_vec_f32(data: Vec<f32>, shape: Shape) -> Result<Self> {
-        if data.len() != shape.numel() {
+    pub fn from_vec_f32(data: Vec<f32>, shape: impl Into<Shape>) -> Result<Self> {
+        let shape = shape.into();
+        let numel = checked_numel(&shape, "Tensor::from_vec_f32")?;
+        if data.len() != numel {
             return Err(Error::ShapeMismatch {
                 expected: Shape::from([data.len()]),
                 got: shape,
@@ -67,12 +69,14 @@ impl Tensor {
 
     /// A contiguous CPU tensor copying `data` with shape `shape`.
     pub fn from_slice(data: &[f32], shape: impl Into<Shape>) -> Result<Self> {
-        Self::from_vec_f32(data.to_vec(), shape.into())
+        Self::from_vec_f32(data.to_vec(), shape)
     }
 
     /// A contiguous CPU `I64` tensor holding `data` (indices, targets).
-    pub fn from_vec_i64(data: Vec<i64>, shape: Shape) -> Result<Self> {
-        if data.len() != shape.numel() {
+    pub fn from_vec_i64(data: Vec<i64>, shape: impl Into<Shape>) -> Result<Self> {
+        let shape = shape.into();
+        let numel = checked_numel(&shape, "Tensor::from_vec_i64")?;
+        if data.len() != numel {
             return Err(Error::ShapeMismatch {
                 expected: Shape::from([data.len()]),
                 got: shape,
@@ -214,7 +218,7 @@ impl Tensor {
     /// elements in a new shape.
     pub fn reshape(&self, shape: impl Into<Shape>) -> Result<Self> {
         let shape = shape.into();
-        if shape.numel() != self.numel() {
+        if checked_numel(&shape, "reshape")? != self.numel() {
             return Err(Error::ShapeMismatch {
                 expected: self.shape().clone(),
                 got: shape,
@@ -330,6 +334,7 @@ impl Tensor {
     /// A zero-copy broadcast view to `shape` (stride 0 on expanded axes).
     pub fn broadcast_to(&self, shape: impl Into<Shape>) -> Result<Self> {
         let shape = shape.into();
+        checked_numel(&shape, "broadcast_to")?;
         let layout = broadcast_layout(&self.layout, &shape)?;
         let out = self.view(layout);
         Ok(crate::ops::record_view(self, out, ViewKind::Broadcast))
@@ -338,6 +343,7 @@ impl Tensor {
     /// A broadcast view that records nothing on the tape — backend
     /// plumbing; prefer [`Tensor::broadcast_to`] in user code.
     pub fn broadcast_view(&self, shape: &Shape) -> Result<Self> {
+        checked_numel(shape, "broadcast_view")?;
         let layout = broadcast_layout(&self.layout, shape)?;
         Ok(self.view(layout))
     }
@@ -432,13 +438,33 @@ impl Tensor {
         self
     }
 
-    /// Whether gradients accumulate on this tensor during `backward`.
+    /// Whether gradients **accumulate on this tensor** during `backward`
+    /// — true for leaves marked with [`requires_grad_`](Self::requires_grad_).
+    ///
+    /// This answers a narrower question than PyTorch's `requires_grad`:
+    /// a tensor *computed from* such a leaf is on the tape but does not
+    /// accumulate a gradient of its own, so it reports `false` here. Ask
+    /// [`is_tracked`](Self::is_tracked) for "is this on the graph at all".
     pub fn requires_grad(&self) -> bool {
         self.autograd.as_ref().is_some_and(|m| m.requires_grad)
     }
 
-    /// Whether this tensor participates in the tape at all.
-    pub(crate) fn is_tracked(&self) -> bool {
+    /// Whether this tensor participates in the autograd tape at all —
+    /// true for a leaf that requires grad and for anything computed from
+    /// one while recording was enabled; false for constants and for
+    /// everything produced under [`no_grad`](crate::autograd::no_grad).
+    ///
+    /// This is the predicate that observes `no_grad`:
+    ///
+    /// ```
+    /// use oxmera_tensor::tensor::Tensor;
+    /// use oxmera_tensor::autograd::no_grad;
+    ///
+    /// let a = Tensor::from_slice(&[1.0, 2.0], [2]).unwrap().requires_grad_(true);
+    /// assert!(a.mul_scalar(3.0).unwrap().is_tracked());
+    /// assert!(!no_grad(|| a.mul_scalar(3.0).unwrap()).is_tracked());
+    /// ```
+    pub fn is_tracked(&self) -> bool {
         self.autograd.is_some()
     }
 
@@ -479,11 +505,21 @@ impl Tensor {
                 ),
             });
         }
-        self.backward_with(Tensor::ones(self.shape().clone()))
+        // The seed lives where the loss lives: a CPU seed against a
+        // device-resident graph failed at the first VJP with a
+        // DeviceMismatch (found by the CUDA backend's end-to-end test, and
+        // latent on Metal).
+        let seed = Tensor::ones(self.shape().clone()).to_device(self.device())?;
+        self.backward_with(seed)
     }
 
     /// Propagate gradients seeding this tensor's gradient with `seed`.
     pub fn backward_with(&self, seed: Tensor) -> Result<()> {
+        let seed = if seed.device() == self.device() {
+            seed
+        } else {
+            seed.to_device(self.device())?
+        };
         crate::autograd::run_backward(self, seed)
     }
 
@@ -531,6 +567,7 @@ fn storage_len(storage: &Storage) -> usize {
         crate::storage::StorageData::Metal(b) => {
             b.buffer().length() as usize / storage.dtype().size_in_bytes()
         }
+        crate::storage::StorageData::Opaque(b) => b.len(),
     }
 }
 
@@ -593,6 +630,30 @@ pub(crate) fn gather_logical<T: Copy>(src: &[T], layout: &Layout) -> Vec<T> {
         return out;
     }
     let strides = layout.strides.values();
+    // Row fast path: when the innermost stride is 1 the row is a slice
+    // copy; when it is 0 (a broadcast dimension being materialized) the
+    // row is one value repeated. Only a genuinely strided innermost
+    // dimension — a transposed view — falls through to the odometer.
+    let ndim = dims.len();
+    let inner = dims[ndim - 1];
+    let inner_stride = strides[ndim - 1];
+    if inner > 0 && (inner_stride == 0 || inner_stride == 1) {
+        let outer = Layout {
+            shape: Shape::new(dims[..ndim - 1].to_vec()),
+            strides: Strides::new(strides[..ndim - 1].to_vec()),
+            offset: layout.offset,
+        };
+        let mut walker = crate::cpu_iter::OffsetWalker::at(&outer, 0);
+        for _ in 0..numel / inner {
+            let base = walker.next_offset();
+            if inner_stride == 1 {
+                out.extend_from_slice(&src[base..base + inner]);
+            } else {
+                out.resize(out.len() + inner, src[base]);
+            }
+        }
+        return out;
+    }
     let mut index = vec![0usize; dims.len()];
     let mut offset = layout.offset as isize;
     loop {
@@ -617,4 +678,16 @@ pub(crate) fn gather_logical<T: Copy>(src: &[T], layout: &Layout) -> Vec<T> {
             return out;
         }
     }
+}
+
+/// The element count of a caller-supplied shape, or a typed error when it
+/// does not fit in `usize` (see [`Shape::checked_numel`]).
+fn checked_numel(shape: &Shape, op: &'static str) -> Result<usize> {
+    shape.checked_numel().ok_or_else(|| Error::InvalidArgument {
+        op,
+        detail: format!(
+            "shape {:?} has more elements than fit in usize",
+            shape.dims()
+        ),
+    })
 }

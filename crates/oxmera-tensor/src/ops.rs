@@ -305,16 +305,27 @@ impl Tensor {
 
     // ---- matmul ----------------------------------------------------------
 
-    /// Matrix product: rank-2 `[m, k] x [k, n]`, or batched rank-3
-    /// `[b, m, k] x [b, k, n]`.
+    /// Matrix product with NumPy/PyTorch batch semantics.
+    ///
+    /// Operands are rank 2 (`[m, k]`) or rank 3 (`[b, m, k]`); a rank-2
+    /// operand behaves as batch 1, and batch dimensions broadcast (1
+    /// against `b`). The result is rank 2 only when both operands are.
+    /// `[2, 2, 3] x [1, 3, 2]` is `[2, 2, 2]`; `[m, k] x [b, k, n]` is
+    /// `[b, m, n]`. See [`plan_matmul`](crate::backend::plan_matmul) for
+    /// the exact contract every backend implements.
     pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor> {
         let device = same_device(self, rhs, "matmul")?;
         let out = backend_for(device)?.matmul(self, rhs)?;
         let (a, b) = (self.clone(), rhs.clone());
         Ok(record(out, vec![self.clone(), rhs.clone()], move |g| {
+            // g is [.., m, n]; the operand grads carry g's batch, which is
+            // then summed down onto a broadcast (or rank-2) operand.
             let ga = backend_for(g.device())?.matmul(g, &b.t()?)?;
             let gb = backend_for(g.device())?.matmul(&a.t()?, g)?;
-            Ok(vec![Some(ga), Some(gb)])
+            Ok(vec![
+                Some(reduce_to_shape(&ga, a.shape())?),
+                Some(reduce_to_shape(&gb, b.shape())?),
+            ])
         }))
     }
 
@@ -406,29 +417,19 @@ impl Tensor {
 
     /// Numerically stable softmax along `dim` — composite.
     pub fn softmax(&self, dim: usize) -> Result<Tensor> {
-        let shifted = self.sub(
-            &self
-                .max_keepdim(&[dim], true)?
-                .detach()
-                .broadcast_to(self.shape().clone())?
-                .contiguous()?,
-        )?;
+        // The row max and row sum stay broadcast views: the binary kernels
+        // consume a stride-0 operand directly, so nothing is materialized.
+        let shifted = self.sub(&self.max_keepdim(&[dim], true)?.detach())?;
         let e = shifted.exp()?;
         let denom = e.sum_keepdim(&[dim], true)?;
-        e.div(&denom.broadcast_to(self.shape().clone())?.contiguous()?)
+        e.div(&denom)
     }
 
     /// Numerically stable log-softmax along `dim` — composite.
     pub fn log_softmax(&self, dim: usize) -> Result<Tensor> {
-        let shifted = self.sub(
-            &self
-                .max_keepdim(&[dim], true)?
-                .detach()
-                .broadcast_to(self.shape().clone())?
-                .contiguous()?,
-        )?;
+        let shifted = self.sub(&self.max_keepdim(&[dim], true)?.detach())?;
         let lse = shifted.exp()?.sum_keepdim(&[dim], true)?.ln()?;
-        shifted.sub(&lse.broadcast_to(self.shape().clone())?.contiguous()?)
+        shifted.sub(&lse)
     }
 
     // ---- indexing -----------------------------------------------------------

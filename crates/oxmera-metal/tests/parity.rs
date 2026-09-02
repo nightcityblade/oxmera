@@ -237,3 +237,110 @@ fn autograd_flows_through_metal() {
         .sum();
     assert!(s > 1e-3, "gradient collapsed to zero: {s}");
 }
+
+/// Issue #17: a zero-element tensor must round-trip and run through every
+/// op family without touching memory it does not own. Every shape here
+/// has numel 0.
+#[test]
+fn zero_element_tensors_are_safe_on_every_path() {
+    let device = metal();
+    for dims in [vec![0usize, 3], vec![2, 0], vec![0], vec![2, 0, 5]] {
+        let t = Tensor::zeros(Shape::new(dims.clone()));
+        let g = t.to_device(device).unwrap();
+        assert_eq!(g.numel(), 0, "{dims:?}");
+        let back = g.to_device(Device::Cpu).unwrap();
+        assert_eq!(back.dims(), &dims[..]);
+        assert!(back.to_vec_f32().unwrap().is_empty());
+        assert_eq!(g.relu().unwrap().numel(), 0, "{dims:?} unary");
+        assert_eq!(g.add(&g).unwrap().numel(), 0, "{dims:?} binary");
+        assert_eq!(g.contiguous().unwrap().numel(), 0, "{dims:?} contiguous");
+        let axes: Vec<usize> = (0..dims.len()).collect();
+        let s = g.sum(&axes).unwrap().to_device(Device::Cpu).unwrap();
+        assert_eq!(
+            s.to_vec_f32().unwrap(),
+            vec![0.0],
+            "{dims:?} sum of nothing is 0"
+        );
+    }
+    // Empty matmul: [2,0] x [0,3] is a 2x3 block of zeros.
+    let a = Tensor::zeros([2usize, 0]).to_device(device).unwrap();
+    let b = Tensor::zeros([0usize, 3]).to_device(device).unwrap();
+    let c = a.matmul(&b).unwrap().to_device(Device::Cpu).unwrap();
+    assert_eq!(c.dims(), &[2, 3]);
+    assert_eq!(c.to_vec_f32().unwrap(), vec![0.0; 6]);
+}
+
+/// Issue #22: batch broadcasting and mixed-rank matmul agree with the CPU.
+#[test]
+fn matmul_batch_broadcast_matches_cpu() {
+    let device = metal();
+    let cases: &[(&[usize], &[usize])] = &[
+        (&[2, 2, 3], &[1, 3, 2]),
+        (&[1, 2, 3], &[4, 3, 2]),
+        (&[2, 3], &[4, 3, 5]),
+        (&[4, 2, 3], &[3, 5]),
+        (&[3, 5, 7], &[3, 7, 2]),
+    ];
+    for (i, (sa, sb)) in cases.iter().enumerate() {
+        let a = Tensor::randn_with_seed(Shape::new(sa.to_vec()), 100 + i as u64);
+        let b = Tensor::randn_with_seed(Shape::new(sb.to_vec()), 200 + i as u64);
+        let cpu = a.matmul(&b).unwrap();
+        let gpu = a
+            .to_device(device)
+            .unwrap()
+            .matmul(&b.to_device(device).unwrap())
+            .unwrap();
+        assert_eq!(cpu.dims(), gpu.dims(), "{sa:?} x {sb:?}");
+        assert_close(
+            &cpu.to_vec_f32().unwrap(),
+            &gpu.to_device(Device::Cpu).unwrap().to_vec_f32().unwrap(),
+            &format!("{sa:?} x {sb:?}"),
+        );
+    }
+}
+
+/// backward() on a device-resident loss: the seed and every gradient stay
+/// on the device, and the leaf gradients match the CPU's.
+#[test]
+fn autograd_runs_end_to_end_on_the_device() {
+    let device = metal();
+    let x = Tensor::randn_with_seed([8, 4], 9)
+        .to_device(device)
+        .unwrap()
+        .requires_grad_(true);
+    let w = Tensor::randn_with_seed([4, 3], 10)
+        .to_device(device)
+        .unwrap()
+        .requires_grad_(true);
+    let loss = x.matmul(&w).unwrap().relu().unwrap().sum(&[0, 1]).unwrap();
+    loss.backward().unwrap();
+    let gw = w.grad().expect("grad on device");
+    assert_eq!(gw.device(), device);
+    let xc = x
+        .detach()
+        .to_device(Device::Cpu)
+        .unwrap()
+        .requires_grad_(true);
+    let wc = w
+        .detach()
+        .to_device(Device::Cpu)
+        .unwrap()
+        .requires_grad_(true);
+    xc.matmul(&wc)
+        .unwrap()
+        .relu()
+        .unwrap()
+        .sum(&[0, 1])
+        .unwrap()
+        .backward()
+        .unwrap();
+    let scale = 1.0 + 8.0f32.sqrt();
+    let cpu = wc.grad().unwrap().to_vec_f32().unwrap();
+    let gpu = gw.to_device(Device::Cpu).unwrap().to_vec_f32().unwrap();
+    for (i, (&c, &g)) in cpu.iter().zip(&gpu).enumerate() {
+        assert!(
+            (c - g).abs() <= TOL * scale * c.abs().max(1.0),
+            "grad[{i}]: {c} vs {g}"
+        );
+    }
+}

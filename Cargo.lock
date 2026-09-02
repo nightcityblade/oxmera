@@ -326,6 +326,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
 
 [[package]]
+name = "cudarc"
+version = "0.19.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "804764d10e844da09765a7b2ca9641a0851523d1702efb0d7299d73e31b86e80"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -746,6 +755,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -966,11 +985,12 @@ dependencies = [
 
 [[package]]
 name = "oxmera"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "oxmera-autograd",
  "oxmera-core",
  "oxmera-cpu",
+ "oxmera-cuda",
  "oxmera-metal",
  "oxmera-nn",
  "oxmera-ops",
@@ -981,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "oxmera-autograd"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "oxmera-core",
  "oxmera-tensor",
@@ -989,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "oxmera-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "crossterm",
  "oxmera",
@@ -1001,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "oxmera-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "thiserror 2.0.20",
@@ -1009,15 +1029,26 @@ dependencies = [
 
 [[package]]
 name = "oxmera-cpu"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "oxmera-core",
  "oxmera-tensor",
 ]
 
 [[package]]
+name = "oxmera-cuda"
+version = "0.2.0"
+dependencies = [
+ "ctor",
+ "cudarc",
+ "libloading",
+ "oxmera-core",
+ "oxmera-tensor",
+]
+
+[[package]]
 name = "oxmera-metal"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "ctor",
  "metal",
@@ -1027,7 +1058,7 @@ dependencies = [
 
 [[package]]
 name = "oxmera-nn"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "oxmera-core",
  "oxmera-tensor",
@@ -1037,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "oxmera-ops"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "oxmera-core",
  "oxmera-tensor",
@@ -1045,7 +1076,7 @@ dependencies = [
 
 [[package]]
 name = "oxmera-optim"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "oxmera-core",
  "oxmera-nn",
@@ -1054,10 +1085,11 @@ dependencies = [
 
 [[package]]
 name = "oxmera-runtime"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "oxmera-core",
  "oxmera-cpu",
+ "oxmera-cuda",
  "oxmera-metal",
  "oxmera-ops",
  "oxmera-tensor",
@@ -1065,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "oxmera-tensor"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "metal",
  "oxmera-core",

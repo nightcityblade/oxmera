@@ -348,8 +348,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxmera-cuda"
-version = "0.1.1"
+name = "oxmera-cuda-oxide"
+version = "0.2.0"
 dependencies = [
  "cuda-core",
  "cuda-device",
