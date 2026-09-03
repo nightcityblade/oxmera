@@ -71,7 +71,12 @@ jobs:
           set -euo pipefail
           version="${TAG#v}"
           ua="oxmera-release (github.com/${GITHUB_REPOSITORY})"
-          crates="oxmera-core oxmera-tensor oxmera-ops oxmera-cpu oxmera-metal oxmera-cuda oxmera-runtime oxmera-autograd oxmera-nn oxmera-optim oxmera oxmera-cli"
+          # Dependency order INCLUDING versioned dev-dependencies: cargo
+          # resolves those against the registry at publish time, so a crate
+          # whose tests depend on oxmera-nn/oxmera-optim (the GPU backends'
+          # fused-optimizer parity tests) must come after them. 0.3.0's first
+          # run stopped at oxmera-metal for exactly this reason.
+          crates="oxmera-core oxmera-tensor oxmera-ops oxmera-cpu oxmera-autograd oxmera-nn oxmera-optim oxmera-metal oxmera-cuda oxmera-runtime oxmera oxmera-cli"
 
           for crate in $crates; do
             # Skip versions already on the registry: that is what makes a
