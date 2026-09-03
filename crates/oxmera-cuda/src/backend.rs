@@ -1,4 +1,4 @@
-//! `CudaBackend`: one context, one stream, one module of five kernels.
+//! `CudaBackend`: one context, one stream, one module of eight kernels.
 //!
 //! Every launch goes through [`CudaBackend::launch`], which pairs a kernel
 //! name with the argument list its CUDA C signature expects; the
@@ -15,7 +15,7 @@ use cudarc::nvrtc::Ptx;
 use oxmera_core::shape::broadcast_shapes;
 use oxmera_core::{DType, Device, Error, Layout, Result, Shape};
 use oxmera_tensor::backend::{
-    Backend, BinaryOp, MatmulPlan, ReduceOp, UnaryOp, plan_matmul, register_backend,
+    AdamStep, Backend, BinaryOp, MatmulPlan, ReduceOp, UnaryOp, plan_matmul, register_backend,
 };
 use oxmera_tensor::storage::{OpaqueBuffer, Storage};
 use oxmera_tensor::tensor::Tensor;
@@ -31,7 +31,31 @@ const KERNEL_NAMES: &[&str] = &[
     "reduce_axis",
     "reduce_full_partials",
     "matmul_tiled",
+    "gather_dim",
+    "scatter_add_dim",
+    "adam_step",
 ];
+
+/// Host mirror of `struct AdamArgs` in `kernels.cu` (ten four-byte words).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AdamArgs {
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    bc1: f32,
+    bc2: f32,
+    decoupled: u32,
+    has_state: u32,
+    numel: u32,
+}
+
+// SAFETY: `#[repr(C)]`, ten four-byte scalar fields with no padding (40
+// bytes), matching the device-side struct byte for byte.
+#[allow(unsafe_code)]
+unsafe impl DeviceRepr for AdamArgs {}
 const MAX_RANK: usize = 8;
 const BLOCK: u32 = 256;
 /// Full reductions at or above this size use the two-stage block kernel.
@@ -128,6 +152,11 @@ pub fn is_driver_present() -> bool {
 /// machine has no CUDA at all; loud only when a device is present but the
 /// kernels cannot be loaded, which is a bug worth seeing.
 pub fn register_default() {
+    // Idempotent, like the Metal backend's: a registered device keeps its
+    // backend (and its context and stream).
+    if oxmera_tensor::backend::backend_for(Device::Cuda { index: 0 }).is_ok() {
+        return;
+    }
     if !is_driver_present() {
         return;
     }
@@ -294,6 +323,17 @@ impl CudaBackend {
         Ok(host)
     }
 
+    /// Upload a validated `u32` index list for the gather/scatter kernels
+    /// (a one-element placeholder when empty; CUDA rejects zero bytes).
+    fn index_slice(&self, idx: &[u32]) -> Result<CudaSlice<u32>> {
+        if idx.is_empty() {
+            return self.stream.alloc_zeros::<u32>(1).map_err(drv("cuda alloc"));
+        }
+        self.stream
+            .clone_htod(idx)
+            .map_err(drv("cuda index upload"))
+    }
+
     /// Strided-to-contiguous copy through the identity unary kernel.
     fn copy_strided(&self, a: &Tensor) -> Result<Tensor> {
         let input = self.buf_of(a, "contiguous")?;
@@ -352,6 +392,23 @@ fn reduce_opcode(op: ReduceOp, ctx: &'static str) -> Result<u32> {
             detail: format!("cuda kernel for {op:?}"),
         }),
     }
+}
+
+/// Validate an `I64` index tensor against `extent` and pack it as `u32`.
+/// Indices live on the host (this backend carries `f32` only).
+fn index_list(indices: &Tensor, extent: usize, shape: &Shape) -> Result<Vec<u32>> {
+    let idx = indices.to_device(Device::Cpu)?.to_vec_i64()?;
+    let mut out = Vec::with_capacity(idx.len());
+    for &i in &idx {
+        if i < 0 || i as usize >= extent {
+            return Err(Error::IndexOutOfBounds {
+                index: vec![i.max(0) as usize],
+                shape: shape.clone(),
+            });
+        }
+        out.push(i as u32);
+    }
+    Ok(out)
 }
 
 fn split_axes(dims: &[usize], axes: &[usize], keepdim: bool) -> (Vec<usize>, Vec<usize>) {
@@ -546,6 +603,141 @@ impl Backend for CudaBackend {
         let slice = self.buf_of(&contiguous, "to_cpu")?;
         let data = self.read_f32(slice, contiguous.numel())?;
         Tensor::from_vec_f32(data, a.shape().clone())
+    }
+
+    fn index_select(&self, a: &Tensor, dim: usize, indices: &Tensor) -> Result<Tensor> {
+        let dims = a.dims();
+        if dim >= dims.len() {
+            return Err(Error::InvalidArgument {
+                op: "index_select",
+                detail: format!("dim {dim} out of range for rank {}", dims.len()),
+            });
+        }
+        let input = self.buf_of(a, "index_select")?;
+        let idx = index_list(indices, dims[dim], a.shape())?;
+        let mut out_dims = dims.to_vec();
+        out_dims[dim] = idx.len();
+        let out_shape = Shape::new(out_dims);
+        let out_numel = out_shape.numel();
+        let mut out = self.alloc_out(out_numel)?;
+        if out_numel > 0 {
+            let idx_dev = self.index_slice(&idx)?;
+            let meta = TensorMeta::from_layout(a.layout(), "index_select")?;
+            let (d, l, n) = (dim as u32, idx.len() as u32, out_numel as u32);
+            let mut b = self.builder("gather_dim");
+            b.arg(input)
+                .arg(&idx_dev)
+                .arg(&mut out)
+                .arg(&meta)
+                .arg(&d)
+                .arg(&l)
+                .arg(&n);
+            self.run(b, Self::linear(out_numel), "gather_dim")?;
+        }
+        self.wrap(out, out_shape)
+    }
+
+    fn index_add(&self, a: &Tensor, dim: usize, indices: &Tensor, src: &Tensor) -> Result<Tensor> {
+        let dims = a.dims();
+        if dim >= dims.len() {
+            return Err(Error::InvalidArgument {
+                op: "index_add",
+                detail: format!("dim {dim} out of range for rank {}", dims.len()),
+            });
+        }
+        let idx = index_list(indices, dims[dim], a.shape())?;
+        let mut expected = dims.to_vec();
+        expected[dim] = idx.len();
+        if src.dims() != expected.as_slice() {
+            return Err(Error::ShapeMismatch {
+                expected: Shape::new(expected),
+                got: src.shape().clone(),
+                op: "index_add",
+            });
+        }
+        let ab = self.buf_of(a, "index_add")?;
+        let sb = self.buf_of(src, "index_add")?;
+        let numel = a.numel();
+        let mut out = self.alloc_out(numel)?;
+        if numel > 0 {
+            let idx_dev = self.index_slice(&idx)?;
+            let ma = TensorMeta::from_layout(a.layout(), "index_add")?;
+            let ms = TensorMeta::from_layout(src.layout(), "index_add")?;
+            let (d, l, n) = (dim as u32, idx.len() as u32, numel as u32);
+            let mut b = self.builder("scatter_add_dim");
+            b.arg(ab)
+                .arg(sb)
+                .arg(&idx_dev)
+                .arg(&mut out)
+                .arg(&ma)
+                .arg(&ms)
+                .arg(&d)
+                .arg(&l)
+                .arg(&n);
+            self.run(b, Self::linear(numel), "scatter_add_dim")?;
+        }
+        self.wrap(out, a.shape().clone())
+    }
+
+    fn adam_step(&self, step: &AdamStep<'_>) -> Result<(Tensor, Tensor, Tensor)> {
+        let numel = step.param.numel();
+        if step.grad.dims() != step.param.dims() {
+            return Err(Error::ShapeMismatch {
+                expected: step.param.shape().clone(),
+                got: step.grad.shape().clone(),
+                op: "adam_step",
+            });
+        }
+        let dense = |t: &Tensor| -> Result<Tensor> {
+            if t.layout().is_contiguous() && t.layout().offset == 0 {
+                Ok(t.clone())
+            } else {
+                self.copy_strided(t)
+            }
+        };
+        let p = dense(step.param)?;
+        let g = dense(step.grad)?;
+        let (m, v) = match (step.m, step.v) {
+            (Some(m), Some(v)) => (dense(m)?, dense(v)?),
+            _ => (p.clone(), p.clone()),
+        };
+        let pb = self.buf_of(&p, "adam_step")?;
+        let gb = self.buf_of(&g, "adam_step")?;
+        let mb = self.buf_of(&m, "adam_step")?;
+        let vb = self.buf_of(&v, "adam_step")?;
+        let mut p_out = self.alloc_out(numel)?;
+        let mut m_out = self.alloc_out(numel)?;
+        let mut v_out = self.alloc_out(numel)?;
+        if numel > 0 {
+            let args = AdamArgs {
+                lr: step.lr,
+                beta1: step.beta1,
+                beta2: step.beta2,
+                eps: step.eps,
+                weight_decay: step.weight_decay,
+                bc1: step.bias_correction1,
+                bc2: step.bias_correction2,
+                decoupled: u32::from(step.decoupled),
+                has_state: u32::from(step.m.is_some() && step.v.is_some()),
+                numel: numel as u32,
+            };
+            let mut b = self.builder("adam_step");
+            b.arg(pb)
+                .arg(gb)
+                .arg(mb)
+                .arg(vb)
+                .arg(&mut p_out)
+                .arg(&mut m_out)
+                .arg(&mut v_out)
+                .arg(&args);
+            self.run(b, Self::linear(numel), "adam_step")?;
+        }
+        let shape = step.param.shape().clone();
+        Ok((
+            self.wrap(p_out, shape.clone())?,
+            self.wrap(m_out, shape.clone())?,
+            self.wrap(v_out, shape)?,
+        ))
     }
 
     fn upload(&self, a: &Tensor) -> Result<Tensor> {

@@ -1,5 +1,5 @@
 // oxmera Metal kernels: strided elementwise, axis reductions, threadgroup
-// full reduction, and tiled matmul. f32 throughout; strided access is
+// full reduction, tiled matmul, and gather/scatter along one dimension. f32 throughout; strided access is
 // described by TensorMeta (dims/strides/offset up to rank 8), with
 // stride 0 encoding broadcast dimensions.
 
@@ -203,4 +203,113 @@ kernel void matmul_tiled(
     if (row < m && col < n) {
         c[c_base + row * n + col] = acc;
     }
+}
+
+// ---- optimizer ---------------------------------------------------------------
+
+// Scalars of one fused Adam/AdamW step; layout shared with the host-side
+// `AdamArgs` (10 four-byte words).
+struct AdamArgs {
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float weight_decay;
+    float bc1;        // 1 - beta1^t
+    float bc2;        // 1 - beta2^t
+    uint decoupled;   // 1: AdamW (decay the weights), 0: Adam (L2 on the gradient)
+    uint has_state;   // 0 on the first step: m/v inputs are ignored
+    uint numel;
+};
+
+// The composite step's formula, one thread per element, three outputs.
+// Inputs contiguous (the host makes them so).
+kernel void adam_step(
+    device const float *p_in [[buffer(0)]],
+    device const float *g_in [[buffer(1)]],
+    device const float *m_in [[buffer(2)]],
+    device const float *v_in [[buffer(3)]],
+    device float *p_out [[buffer(4)]],
+    device float *m_out [[buffer(5)]],
+    device float *v_out [[buffer(6)]],
+    constant AdamArgs &a [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= a.numel) return;
+    float p = p_in[gid];
+    float g = g_in[gid];
+    if (a.weight_decay != 0.0f) {
+        if (a.decoupled != 0) p = p * (1.0f - a.lr * a.weight_decay);
+        else g = g + p * a.weight_decay;
+    }
+    float m = a.has_state != 0 ? m_in[gid] * a.beta1 + g * (1.0f - a.beta1) : g * (1.0f - a.beta1);
+    float g2 = g * g;
+    float v = a.has_state != 0 ? v_in[gid] * a.beta2 + g2 * (1.0f - a.beta2) : g2 * (1.0f - a.beta2);
+    float m_hat = m * (1.0f / a.bc1);
+    float v_hat = v * (1.0f / a.bc2);
+    float update = m_hat / (sqrt(v_hat) + a.eps);
+    p_out[gid] = p - update * a.lr;
+    m_out[gid] = m;
+    v_out[gid] = v;
+}
+
+// ---- gather / scatter ------------------------------------------------------
+
+// index_select along `dim`: output is the source with dimension `dim`
+// replaced by the selected rows, contiguous. Element gid of the output
+// decomposes as (outer, k, inner); the source row is idx[k]. The source
+// may be strided (meta), so nothing is copied first.
+kernel void gather_dim(
+    device const float *input [[buffer(0)]],
+    device const uint *idx [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant TensorMeta &meta [[buffer(3)]],
+    constant uint &dim [[buffer(4)]],
+    constant uint &idx_len [[buffer(5)]],
+    constant uint &out_numel [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= out_numel) return;
+    uint inner = 1;
+    for (uint d = dim + 1; d < meta.rank; d++) inner *= meta.dims[d];
+    uint nd = meta.dims[dim];
+    uint j = gid % inner;
+    uint k = (gid / inner) % idx_len;
+    uint o = gid / (inner * idx_len);
+    uint lin = (o * nd + idx[k]) * inner + j;
+    output[gid] = input[strided_offset(lin, meta)];
+}
+
+// index_add along `dim`: output = a, then output[.., idx[k], ..] += src[.., k, ..]
+// for every k. One thread per OUTPUT element, scanning the index list for
+// hits: deterministic (adds happen in k order, exactly as the CPU
+// reference) and free of atomics, at O(idx_len) per element — the sizes
+// this serves (narrow VJPs, cat/pad, embedding rows) keep idx_len small.
+kernel void scatter_add_dim(
+    device const float *a [[buffer(0)]],
+    device const float *src [[buffer(1)]],
+    device const uint *idx [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant TensorMeta &ma [[buffer(4)]],
+    constant TensorMeta &ms [[buffer(5)]],
+    constant uint &dim [[buffer(6)]],
+    constant uint &idx_len [[buffer(7)]],
+    constant uint &numel [[buffer(8)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= numel) return;
+    uint inner = 1;
+    for (uint d = dim + 1; d < ma.rank; d++) inner *= ma.dims[d];
+    uint nd = ma.dims[dim];
+    uint j = gid % inner;
+    uint t = (gid / inner) % nd;
+    uint o = gid / (inner * nd);
+    float acc = a[strided_offset(gid, ma)];
+    for (uint k = 0; k < idx_len; k++) {
+        if (idx[k] == t) {
+            uint src_lin = (o * idx_len + k) * inner + j;
+            acc += src[strided_offset(src_lin, ms)];
+        }
+    }
+    output[gid] = acc;
 }

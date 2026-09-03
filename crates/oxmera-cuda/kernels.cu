@@ -1,5 +1,6 @@
 // oxmera CUDA kernels: strided elementwise, axis reductions, block-level
-// full reduction, and tiled matmul — a one-to-one port of kernels.metal
+// full reduction, tiled matmul, and gather/scatter along one dimension — a
+// one-to-one port of kernels.metal
 // (same TensorMeta ABI, same opcodes) so the two GPU backends share one
 // host-side contract. f32 throughout; strided access is described by
 // TensorMeta (dims/strides/offset up to rank 8), with stride 0 encoding a
@@ -217,4 +218,113 @@ extern "C" __global__ void matmul_tiled(
     if (row < m && col < n) {
         c[c_base + row * n + col] = acc;
     }
+}
+
+// ---- optimizer ---------------------------------------------------------------
+
+// Scalars of one fused Adam/AdamW step; layout shared with the host-side
+// `AdamArgs` (10 four-byte words).
+struct AdamArgs {
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float weight_decay;
+    float bc1;                 // 1 - beta1^t
+    float bc2;                 // 1 - beta2^t
+    unsigned int decoupled;    // 1: AdamW (decay the weights), 0: Adam (L2 on the gradient)
+    unsigned int has_state;    // 0 on the first step: m/v inputs are ignored
+    unsigned int numel;
+};
+
+// The composite step's formula, one thread per element, three outputs.
+// Inputs contiguous (the host makes them so). No barrier, no divergence
+// question.
+extern "C" __global__ void adam_step(
+    const float* __restrict__ p_in,
+    const float* __restrict__ g_in,
+    const float* __restrict__ m_in,
+    const float* __restrict__ v_in,
+    float* __restrict__ p_out,
+    float* __restrict__ m_out,
+    float* __restrict__ v_out,
+    AdamArgs a)
+{
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= a.numel) return;
+    float p = p_in[gid];
+    float g = g_in[gid];
+    if (a.weight_decay != 0.0f) {
+        if (a.decoupled != 0) p = p * (1.0f - a.lr * a.weight_decay);
+        else g = g + p * a.weight_decay;
+    }
+    float m = a.has_state != 0 ? m_in[gid] * a.beta1 + g * (1.0f - a.beta1) : g * (1.0f - a.beta1);
+    float g2 = g * g;
+    float v = a.has_state != 0 ? v_in[gid] * a.beta2 + g2 * (1.0f - a.beta2) : g2 * (1.0f - a.beta2);
+    float m_hat = m * (1.0f / a.bc1);
+    float v_hat = v * (1.0f / a.bc2);
+    float update = m_hat / (sqrtf(v_hat) + a.eps);
+    p_out[gid] = p - update * a.lr;
+    m_out[gid] = m;
+    v_out[gid] = v;
+}
+
+// ---- gather / scatter ------------------------------------------------------
+
+// index_select along `dim`: output is the source with dimension `dim`
+// replaced by the selected rows, contiguous. Element gid of the output
+// decomposes as (outer, k, inner); the source row is idx[k]. The source
+// may be strided (meta), so nothing is copied first.
+extern "C" __global__ void gather_dim(
+    const float* __restrict__ input,
+    const unsigned int* __restrict__ idx,
+    float* __restrict__ output,
+    TensorMeta meta,
+    unsigned int dim,
+    unsigned int idx_len,
+    unsigned int out_numel)
+{
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= out_numel) return;
+    unsigned int inner = 1;
+    for (unsigned int d = dim + 1; d < meta.rank; d++) inner *= meta.dims[d];
+    unsigned int nd = meta.dims[dim];
+    unsigned int j = gid % inner;
+    unsigned int k = (gid / inner) % idx_len;
+    unsigned int o = gid / (inner * idx_len);
+    unsigned int lin = (o * nd + idx[k]) * inner + j;
+    output[gid] = input[strided_offset(lin, meta)];
+}
+
+// index_add along `dim`: output = a, then output[.., idx[k], ..] += src[.., k, ..]
+// for every k. One thread per OUTPUT element scanning the index list:
+// deterministic (adds in k order, as the CPU reference) and atomic-free,
+// O(idx_len) per element. No barrier anywhere, so no convergence question.
+extern "C" __global__ void scatter_add_dim(
+    const float* __restrict__ a,
+    const float* __restrict__ src,
+    const unsigned int* __restrict__ idx,
+    float* __restrict__ output,
+    TensorMeta ma,
+    TensorMeta ms,
+    unsigned int dim,
+    unsigned int idx_len,
+    unsigned int numel)
+{
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= numel) return;
+    unsigned int inner = 1;
+    for (unsigned int d = dim + 1; d < ma.rank; d++) inner *= ma.dims[d];
+    unsigned int nd = ma.dims[dim];
+    unsigned int j = gid % inner;
+    unsigned int t = (gid / inner) % nd;
+    unsigned int o = gid / (inner * nd);
+    float acc = a[strided_offset(gid, ma)];
+    for (unsigned int k = 0; k < idx_len; k++) {
+        if (idx[k] == t) {
+            unsigned int src_lin = (o * idx_len + k) * inner + j;
+            acc += src[strided_offset(src_lin, ms)];
+        }
+    }
+    output[gid] = acc;
 }

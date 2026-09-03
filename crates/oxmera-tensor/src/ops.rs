@@ -3,7 +3,7 @@
 //! input is tracked, attaches the exact vector-Jacobian product to the
 //! output's tape node.
 
-use oxmera_core::{Device, Error, Result, Shape};
+use oxmera_core::{DType, Device, Error, Result, Shape};
 
 use crate::autograd::{GradFn, is_recording};
 use crate::backend::{Backend, BinaryOp, ReduceOp, UnaryOp, backend_for};
@@ -77,6 +77,7 @@ pub(crate) fn record_view(input: &Tensor, out: Tensor, kind: ViewKind) -> Tensor
                 let indices: Vec<i64> = (*start..start + len).map(|i| i as i64).collect();
                 let indices = Tensor::from_vec_i64(indices, Shape::from([*len]))?;
                 Tensor::zeros(in_shape.clone())
+                    .to_dtype(g.dtype())?
                     .to_device(g.device())?
                     .index_add(*dim, &indices, g)?
             }
@@ -188,10 +189,58 @@ impl Tensor {
         self.unary_op(UnaryOp::Sigmoid)
     }
 
-    /// A scalar constant on the same device as `like` (plumbing for VJPs
-    /// and scalar operator overloads).
+    /// A scalar constant with the dtype and device of `like` (plumbing for
+    /// VJPs and scalar operator overloads).
     pub fn scalar_on(like: &Tensor, value: f32) -> Result<Tensor> {
-        Tensor::scalar(value).to_device(like.device())
+        let s = match like.dtype() {
+            DType::F64 => Tensor::from_vec_f64(vec![f64::from(value)], Shape::from([]))?,
+            _ => Tensor::scalar(value),
+        };
+        s.to_device(like.device())
+    }
+
+    /// This tensor's elements converted to `dtype` (`F32` ↔ `F64`, or
+    /// `I64` → float). A no-op clone for the same dtype. CPU only for
+    /// `F64`; differentiable (the gradient converts back).
+    pub fn to_dtype(&self, dtype: DType) -> Result<Tensor> {
+        if self.dtype() == dtype {
+            return Ok(self.clone());
+        }
+        if self.device() != Device::Cpu {
+            return Err(Error::UnsupportedDType {
+                dtype,
+                op: "to_dtype (device tensors are f32; convert on the CPU)",
+            });
+        }
+        let shape = self.shape().clone();
+        let out = match (self.dtype(), dtype) {
+            (DType::F32, DType::F64) => Tensor::from_vec_f64(
+                self.to_vec_f32()?.into_iter().map(f64::from).collect(),
+                shape,
+            )?,
+            (DType::F64, DType::F32) => Tensor::from_vec_f32(
+                self.to_vec_f64()?.into_iter().map(|x| x as f32).collect(),
+                shape,
+            )?,
+            (DType::I64, DType::F32) => Tensor::from_vec_f32(
+                self.to_vec_i64()?.into_iter().map(|x| x as f32).collect(),
+                shape,
+            )?,
+            (DType::I64, DType::F64) => Tensor::from_vec_f64(
+                self.to_vec_i64()?.into_iter().map(|x| x as f64).collect(),
+                shape,
+            )?,
+            (_, to) => {
+                return Err(Error::UnsupportedDType {
+                    dtype: to,
+                    op: "to_dtype",
+                });
+            }
+        };
+        let from = self.dtype();
+        Ok(record(out, vec![self.clone()], move |g| {
+            Ok(vec![Some(g.to_dtype(from)?)])
+        }))
     }
 
     // ---- binary ----------------------------------------------------------
@@ -307,14 +356,27 @@ impl Tensor {
 
     /// Matrix product with NumPy/PyTorch batch semantics.
     ///
-    /// Operands are rank 2 (`[m, k]`) or rank 3 (`[b, m, k]`); a rank-2
-    /// operand behaves as batch 1, and batch dimensions broadcast (1
-    /// against `b`). The result is rank 2 only when both operands are.
-    /// `[2, 2, 3] x [1, 3, 2]` is `[2, 2, 2]`; `[m, k] x [b, k, n]` is
-    /// `[b, m, n]`. See [`plan_matmul`](crate::backend::plan_matmul) for
-    /// the exact contract every backend implements.
+    /// The last two dimensions are the matrix (`[.., m, k] x [.., k, n]`
+    /// → `[.., m, n]`); every leading dimension is a batch dimension, and
+    /// batch dimensions broadcast against each other (1 against `b`, and
+    /// a missing leading dimension counts as 1). A rank-2 operand is one
+    /// matrix for every batch of the other. The result is rank 2 only
+    /// when both operands are: `[2, 2, 3] x [1, 3, 2]` is `[2, 2, 2]`,
+    /// `[m, k] x [b, k, n]` is `[b, m, n]`, `[2, 1, 3, 4] x [5, 4, 6]` is
+    /// `[2, 5, 3, 6]`.
+    ///
+    /// Backends implement the rank-2/rank-3 contract of
+    /// [`plan_matmul`](crate::backend::plan_matmul); higher ranks are
+    /// lowered here — the batch dimensions are broadcast (a zero-stride
+    /// view, materialized only when an operand's batch really has to be
+    /// repeated), flattened to one batch axis, multiplied, and unflattened
+    /// — and every step is a recorded op, so the gradient needs no VJP of
+    /// its own.
     pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor> {
         let device = same_device(self, rhs, "matmul")?;
+        if self.ndim() > 3 || rhs.ndim() > 3 {
+            return self.matmul_lowered(rhs);
+        }
         let out = backend_for(device)?.matmul(self, rhs)?;
         let (a, b) = (self.clone(), rhs.clone());
         Ok(record(out, vec![self.clone(), rhs.clone()], move |g| {
@@ -327,6 +389,65 @@ impl Tensor {
                 Some(reduce_to_shape(&gb, b.shape())?),
             ])
         }))
+    }
+
+    /// Rank ≥ 4 matmul: broadcast the batch dimensions, flatten them to one,
+    /// run the rank-3 contract, unflatten. Composed from recorded view ops.
+    fn matmul_lowered(&self, rhs: &Tensor) -> Result<Tensor> {
+        let (ad, bd) = (self.dims(), rhs.dims());
+        if ad.len() < 2 || bd.len() < 2 {
+            return Err(Error::InvalidArgument {
+                op: "matmul",
+                detail: format!("operands need rank >= 2; got {}x{}", ad.len(), bd.len()),
+            });
+        }
+        let (m, k) = (ad[ad.len() - 2], ad[ad.len() - 1]);
+        let (kb, n) = (bd[bd.len() - 2], bd[bd.len() - 1]);
+        if k != kb {
+            return Err(Error::ShapeMismatch {
+                expected: Shape::new(bd[..bd.len() - 2].iter().copied().chain([k, n]).collect()),
+                got: rhs.shape().clone(),
+                op: "matmul",
+            });
+        }
+        let a_batch = Shape::new(ad[..ad.len() - 2].to_vec());
+        let b_batch = Shape::new(bd[..bd.len() - 2].to_vec());
+        let batch = oxmera_core::shape::broadcast_shapes(&a_batch, &b_batch).map_err(|_| {
+            Error::BroadcastIncompatible {
+                lhs: self.shape().clone(),
+                rhs: rhs.shape().clone(),
+            }
+        })?;
+        let batch_numel = batch.numel();
+        // An operand whose batch is a single matrix stays rank 2 and lets
+        // the backend broadcast it with a zero batch stride; anything else
+        // is expanded to the full batch and flattened.
+        let lower = |t: &Tensor, own: &Shape, rows: usize, cols: usize| -> Result<Tensor> {
+            if own.numel() == 1 {
+                return t.reshape(Shape::from([rows, cols]));
+            }
+            let full: Vec<usize> = batch.dims().iter().copied().chain([rows, cols]).collect();
+            let expanded = if own.dims() == batch.dims() {
+                t.clone()
+            } else {
+                // Right-align the operand's batch dims under the broadcast
+                // batch, then take the (recorded) zero-stride view.
+                let lead = batch.ndim() - own.ndim();
+                let padded: Vec<usize> = std::iter::repeat_n(1usize, lead)
+                    .chain(own.dims().iter().copied())
+                    .chain([rows, cols])
+                    .collect();
+                t.reshape(Shape::new(padded))?
+                    .broadcast_to(Shape::new(full.clone()))?
+                    .contiguous()?
+            };
+            expanded.reshape(Shape::from([batch_numel, rows, cols]))
+        };
+        let a3 = lower(self, &a_batch, m, k)?;
+        let b3 = lower(rhs, &b_batch, k, n)?;
+        let out = a3.matmul(&b3)?;
+        let out_shape: Vec<usize> = batch.dims().iter().copied().chain([m, n]).collect();
+        out.reshape(Shape::new(out_shape))
     }
 
     // ---- reductions --------------------------------------------------------
@@ -434,20 +555,28 @@ impl Tensor {
 
     // ---- indexing -----------------------------------------------------------
 
-    /// Rows of `self` along `dim` selected by `indices` (`I64`).
+    /// Rows of `self` along `dim` selected by `indices` (`I64`, on the CPU).
     pub fn index_select(&self, dim: usize, indices: &Tensor) -> Result<Tensor> {
-        let out = dispatch_index(self, |be, t| be.index_select(t, dim, indices))?;
+        let out = dispatch_index(self, &[indices], |be, t, extra| {
+            be.index_select(t, dim, &extra[0])
+        })?;
         let in_shape = self.shape().clone();
         let idx = indices.clone();
         Ok(record(out, vec![self.clone()], move |g| {
-            let zeros = Tensor::zeros(in_shape.clone()).to_device(g.device())?;
+            let zeros = Tensor::zeros(in_shape.clone())
+                .to_dtype(g.dtype())?
+                .to_device(g.device())?;
             Ok(vec![Some(zeros.index_add(dim, &idx, g)?)])
         }))
     }
 
     /// `out[indices[i]] += src[i]` along `dim`, on a fresh copy of `self`.
+    /// `indices` is `I64` on the CPU; `src` lives on `self`'s device.
     pub fn index_add(&self, dim: usize, indices: &Tensor, src: &Tensor) -> Result<Tensor> {
-        let out = dispatch_index(self, |be, t| be.index_add(t, dim, indices, src))?;
+        same_device(self, src, "index_add")?;
+        let out = dispatch_index(self, &[indices, src], |be, t, extra| {
+            be.index_add(t, dim, &extra[0], &extra[1])
+        })?;
         let idx = indices.clone();
         Ok(record(out, vec![self.clone(), src.clone()], move |g| {
             Ok(vec![Some(g.clone()), Some(g.index_select(dim, &idx)?)])
@@ -457,9 +586,16 @@ impl Tensor {
     // ---- device movement ------------------------------------------------------
 
     /// This tensor's data on `device` (a cheap clone when already there).
+    /// `F64` tensors are CPU-only: moving one to a GPU is a typed error.
     pub fn to_device(&self, device: Device) -> Result<Tensor> {
         if self.device() == device {
             return Ok(self.clone());
+        }
+        if self.dtype() == DType::F64 {
+            return Err(Error::UnsupportedDType {
+                dtype: DType::F64,
+                op: "to_device (f64 tensors live on the CPU; to_dtype(F32) first)",
+            });
         }
         let out = match (self.device(), device) {
             (Device::Cpu, target) => backend_for(target)?.upload(&self.contiguous_data()?)?,
@@ -507,17 +643,27 @@ fn normalize_axes(axes: &[usize], ndim: usize, op: &'static str) -> Result<Vec<u
 }
 
 /// Run an index op on the tensor's backend, falling back to a CPU
-/// round-trip when the backend declines.
+/// round-trip when the backend declines. Every tensor operand — the
+/// indices and, for `index_add`, the source — takes the round-trip too:
+/// moving only `t` left `src` on the device and failed the CPU backend
+/// with a DeviceMismatch inside the `narrow` VJP (found by oxmega's
+/// k-DPP loss on CUDA).
 fn dispatch_index(
     t: &Tensor,
-    f: impl Fn(&dyn Backend, &Tensor) -> Result<Tensor>,
+    extra: &[&Tensor],
+    f: impl Fn(&dyn Backend, &Tensor, &[Tensor]) -> Result<Tensor>,
 ) -> Result<Tensor> {
     let backend = backend_for(t.device())?;
-    match f(backend.as_ref(), t) {
+    let on_device: Vec<Tensor> = extra.iter().map(|e| (*e).clone()).collect();
+    match f(backend.as_ref(), t, &on_device) {
         Err(Error::NotImplemented { .. }) if t.device() != Device::Cpu => {
             let cpu = backend.download(t)?;
+            let cpu_extra: Vec<Tensor> = extra
+                .iter()
+                .map(|e| e.to_device(Device::Cpu))
+                .collect::<Result<_>>()?;
             let cpu_backend = backend_for(Device::Cpu)?;
-            let out = f(cpu_backend.as_ref(), &cpu)?;
+            let out = f(cpu_backend.as_ref(), &cpu, &cpu_extra)?;
             backend_for(t.device())?.upload(&out)
         }
         other => other,

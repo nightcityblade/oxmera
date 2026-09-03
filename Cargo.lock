@@ -985,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "oxmera"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "oxmera-autograd",
  "oxmera-core",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "oxmera-autograd"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "oxmera-core",
  "oxmera-tensor",
@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "oxmera-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crossterm",
  "oxmera",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "oxmera-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proptest",
  "thiserror 2.0.20",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "oxmera-cpu"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "oxmera-core",
  "oxmera-tensor",
@@ -1037,28 +1037,32 @@ dependencies = [
 
 [[package]]
 name = "oxmera-cuda"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ctor",
  "cudarc",
  "libloading",
  "oxmera-core",
+ "oxmera-nn",
+ "oxmera-optim",
  "oxmera-tensor",
 ]
 
 [[package]]
 name = "oxmera-metal"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ctor",
  "metal",
  "oxmera-core",
+ "oxmera-nn",
+ "oxmera-optim",
  "oxmera-tensor",
 ]
 
 [[package]]
 name = "oxmera-nn"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "oxmera-core",
  "oxmera-tensor",
@@ -1068,7 +1072,7 @@ dependencies = [
 
 [[package]]
 name = "oxmera-ops"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "oxmera-core",
  "oxmera-tensor",
@@ -1076,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "oxmera-optim"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "oxmera-core",
  "oxmera-nn",
@@ -1085,7 +1089,7 @@ dependencies = [
 
 [[package]]
 name = "oxmera-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "oxmera-core",
  "oxmera-cpu",
@@ -1097,7 +1101,7 @@ dependencies = [
 
 [[package]]
 name = "oxmera-tensor"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "metal",
  "oxmera-core",
@@ -1916,9 +1920,9 @@ dependencies = [
 
 [[package]]
 name = "termlens"
-version = "0.6.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b76566a0782145bfc8034bfb806beda713e750f6f902d74eb6a83d6bc4a52675"
+checksum = "39a9a3fa530273a2584c50d694690a493a5018b5d5b35f232d6c533825e1b990"
 dependencies = [
  "insta",
  "libc",
