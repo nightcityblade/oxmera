@@ -31,4 +31,9 @@ signal-hook = "0.3"
 
 
 [dev-dependencies]
-termlens = "0.9"
+# `serde` is what turns a failing wait's artifact from `.screen.txt` into
+# `.screen.json` under TERMLENS_ARTIFACT_DIR (see ci.yml / stress.yml), and
+# it is what `tests/emulation.rs` round-trips a dashboard frame through.
+# It costs no new crate here: serde_json is already in the lockfile.
+termlens = { version = "0.10", features = ["serde"] }
+serde_json = "1"

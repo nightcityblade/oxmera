@@ -1,5 +1,7 @@
 # termlens through a real PTY on hermetic fixtures, ubuntu and macos:
-# three environment-shape goldens plus the 100-iteration stress.
+# three environment-shape goldens plus the 100-iteration stress, and the
+# termlens-cli suite, which is `#[ignore]`d so that a plain `cargo test` in
+# a fresh clone never `cargo install`s anything behind a contributor's back.
 
 name: stress
 
@@ -25,3 +27,27 @@ jobs:
           toolchain: stable
       - name: Doctor and dashboard goldens with 100-iteration stresses
         run: cargo test -p oxmera-cli --test doctor --test tui
+        env:
+          # Every screen a failing wait carries is also written here, so the
+          # `report` step below can put it in the job summary rather than
+          # leaving it in a log. These are the two tests most likely to fail
+          # once in a blue moon on a loaded runner, and a stress failure
+          # nobody can look at is a stress failure nobody can fix.
+          TERMLENS_ARTIFACT_DIR: ${{ runner.temp }}/termlens
+      # `tests/termlens_cli.rs` is `#[ignore]`d — oxmera-cli is published,
+      # and `cargo test` must never install a tool on a contributor's
+      # machine unasked. CI is where it should run, so CI asks for it by
+      # name. It installs the version the lockfile names, so the command and
+      # the library under test are one release.
+      - name: The termlens-cli suite against the committed goldens
+        run: cargo test -p oxmera-cli --test termlens_cli -- --ignored
+        env:
+          TERMLENS_ARTIFACT_DIR: ${{ runner.temp }}/termlens
+      # A PTY failure is a picture, and a log is the worst place to read
+      # one. This renders every screen the two steps above left behind into
+      # the job summary, with SVG and HTML uploaded.
+      - uses: vyncint/termlens/.github/actions/report@e1b96c8203fd727fa3458af395719c429966ee82 # v0.10.1
+        if: failure()
+        with:
+          cli-version: "0.10.1"
+          name: termlens-report-stress-${{ matrix.os }}

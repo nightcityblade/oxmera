@@ -135,15 +135,26 @@ fn esc_also_quits() -> termlens::Result<()> {
 /// The 100-iteration stress: a full replay must paint the identical final
 /// frame every time — no races, no mid-paint captures, no
 /// nondeterminism.
+///
+/// `Screen::diff` rather than comparing two normalized strings (termlens
+/// 0.10). It is a strictly stronger claim and a far better failure: the
+/// string compare saw text only, so a run that painted the loss sparkline
+/// green would have passed it, and `normalize` trimmed trailing whitespace
+/// away before comparing. `diff` compares cells, styles and the cursor,
+/// which turns this into a colour-stability stress as well; and where it
+/// fails it renders only the rows that moved, with a marker under each
+/// changed column, instead of two 46-line walls to read by eye.
 #[test]
 fn stress_100_iterations_are_identical() -> termlens::Result<()> {
-    let (first, first_screen) = spawn((100, 45))?;
-    let reference = normalize(&first_screen.to_string());
+    let (first, reference) = spawn((100, 45))?;
     quit(first, "stress reference")?;
     for i in 1..100 {
         let (t, screen) = spawn((100, 45))?;
-        let frame = normalize(&screen.to_string());
-        assert_eq!(reference, frame, "iteration {i} painted a different frame");
+        let diff = reference.diff(&screen);
+        assert!(
+            diff.is_empty(),
+            "iteration {i} painted a different frame:\n{diff}"
+        );
         quit(t, "stress")?;
     }
     Ok(())

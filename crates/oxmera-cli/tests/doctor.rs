@@ -123,12 +123,22 @@ fn cuda_shape() -> termlens::Result<()> {
 
 /// The 100-iteration stress: the same fixture must paint the same frame
 /// every single time.
+///
+/// `Screen::diff` rather than comparing two normalized strings (termlens
+/// 0.10) — a strictly stronger claim on a better failure. The string
+/// compare read text after `normalize` had trimmed every trailing space;
+/// `diff` compares cells, styles and the cursor, and prints only the rows
+/// that moved with a marker under each changed column.
 #[test]
 fn stress_100_iterations_are_identical() -> termlens::Result<()> {
-    let first = normalize(&doctor_screen("metal.toml")?.to_string());
+    let first = doctor_screen("metal.toml")?;
     for i in 1..100 {
-        let frame = normalize(&doctor_screen("metal.toml")?.to_string());
-        assert_eq!(first, frame, "iteration {i} painted a different frame");
+        let frame = doctor_screen("metal.toml")?;
+        let diff = first.diff(&frame);
+        assert!(
+            diff.is_empty(),
+            "iteration {i} painted a different frame:\n{diff}"
+        );
     }
     Ok(())
 }

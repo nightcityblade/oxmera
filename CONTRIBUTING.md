@@ -78,8 +78,16 @@ that and reports upstream HEAD for information only; when HEAD needs a
 newer nightly than reconverge is built on, the pin waits for a reconverge
 release, not the other way round.
 
-`termlens` (currently 0.9.0) pairs with nothing and moves alone, in its own
-commit, gated by the PTY suites and both 100-iteration stresses.
+`termlens` (currently 0.10.1) pairs with nothing and moves alone, in its own
+commit, gated by the PTY suites and both 100-iteration stresses. A bump must
+touch, together: the dev-dependency in `crates/oxmera-cli/Cargo.toml` (the
+only manifest that names it), `Cargo.lock` (three jobs run `--locked`),
+`PIN_TERMLENS` in `.github/workflows/pins.yml`, this line, and the vendored
+agent skill `.claude/skills/termlens/SKILL.md` — copied verbatim from
+`termlens/skills/termlens/SKILL.md`, since the published crate does not ship
+it. `.github/scripts/check-skill-version.sh` fails CI when the skill and the
+dependency disagree on major.minor, because a stale copy is otherwise silent:
+it hands every agent working here the idioms of a release that is gone.
 
 ## Testing policy
 

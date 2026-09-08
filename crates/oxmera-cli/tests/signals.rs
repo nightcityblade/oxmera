@@ -67,6 +67,21 @@ fn a_signal_gives_the_terminal_back_and_still_kills_the_process() -> termlens::R
         );
         let (_, _, visible) = after.cursor();
         assert!(visible, "{name}: left the cursor hidden");
+        // Visible is half of "given back". A terminal whose cursor came
+        // back as a blinking bar when the user had a steady block is still
+        // a terminal that was not restored, and `alternate_screen` cannot
+        // see that. oxmera sets no DECSCUSR, so both must be untouched
+        // (termlens 0.7 exposed them; nothing here asserted it).
+        assert_eq!(
+            after.cursor_shape(),
+            termlens::CursorShape::Default,
+            "{name}: gave the cursor back with a different shape"
+        );
+        assert_eq!(
+            after.cursor_blink(),
+            None,
+            "{name}: gave the cursor back blinking"
+        );
         // `contains`, not `==`: macOS spells this "Terminated: 15" and
         // Linux "Terminated". Asserting the exact string passed on Linux
         // and failed the macOS leg while the behaviour under test was
