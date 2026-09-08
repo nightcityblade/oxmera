@@ -34,10 +34,27 @@ jobs:
         run: cargo check --workspace --all-targets --locked
       - name: Test
         run: cargo test --workspace
+        env:
+          # Every screen a failing termlens wait carries is also written
+          # here, so the `report` step below can put it in the job summary
+          # instead of leaving it in a log someone has to scroll. With the
+          # `serde` feature on the dev-dependency these are `.screen.json`
+          # (termlens 0.10).
+          TERMLENS_ARTIFACT_DIR: ${{ runner.temp }}/termlens
       - name: Docs are warning-free
         run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      # A PTY failure is a picture, and a log is the worst place to read
+      # one. This renders every screen the suite left behind into the job
+      # summary, with SVG and HTML uploaded. It installs termlens-cli
+      # itself, pinned to the version the lockfile names so the renderer and
+      # the harness are one release.
+      - uses: vyncint/termlens/.github/actions/report@e1b96c8203fd727fa3458af395719c429966ee82 # v0.10.1
+        if: failure()
+        with:
+          cli-version: "0.10.1"
+          name: termlens-report-ci-${{ matrix.os }}
 
   # The second configuration. Until 0.4.0 exactly one existed — every job
   # built the workspace defaults — so `--no-default-features` had never
@@ -94,6 +111,21 @@ jobs:
           toolchain: "1.88"
       - name: MSRV check against the committed lockfile
         run: cargo +1.88 check --workspace --all-targets --locked
+
+  # The vendored termlens skill is refreshed by hand, and a stale copy is
+  # silent: every agent working in this repository is then handed guidance
+  # for a version that is no longer the dev-dependency. Nothing can diff it
+  # against upstream — the published crate does not ship the skill — but the
+  # two versions agreeing is checkable, and that is the drift that happens.
+  # The 0.9 copy taught `assert_screen_snapshot!(screen)` and `mouse_mode()`,
+  # both of which 0.10 changed, and nothing here noticed.
+  skill-version:
+    name: skill version (vendored termlens skill)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: The vendored skill names the version we depend on
+        run: ./.github/scripts/check-skill-version.sh
 
   firewall:
     name: firewall (cargo-deny)

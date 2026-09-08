@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **termlens 0.9.0 → 0.10.1**, with the `serde` feature, and the terminal
+  suite grown into the surface it opens. No call site broke: the crate never
+  used `drag`, a `termlens::Style` literal, `assert_screen_snapshot!` or a
+  `match` on `termlens::Error`, so the version bump is the manifest, the
+  lockfile and the strings that name it. What the release buys is coverage
+  that did not exist:
+
+  - `tests/emulation.rs` — the invariant the rest of the suite rests on.
+    `Screen::unsupported()` is pinned exactly: `["^[[59m"]` for the
+    dashboard (ratatui's underline-colour reset, which changes no cell) and
+    empty for `doctor`, whose report is plain text. A sequence joining
+    either list means the grid the goldens were blessed from may be wrong.
+    Plus `insert_mode`, `visual_bells`, `bells`, `links`, `title`,
+    `mouse_modes` and both round trips — the snapshot text format and the
+    JSON `TERMLENS_ARTIFACT_DIR` writes.
+  - `tests/styles.rs` — the dashboard's colour, which the goldens
+    structurally cannot see: they compare `to_string()`. Until now the loss
+    and accuracy sparkline colours could be swapped, the header's bold
+    dropped, or the gauge cyan lost, with every test still green.
+  - `tests/report.rs` — the report at 80 columns measured rather than
+    modelled (`row_wrapped`, with a 60-column leg so the claim is not
+    vacuous), the rows that scroll off a 24-row terminal (`scrollback_*`,
+    `locate`), and the first coverage `src/probe.rs` has ever had: the
+    real-machine path, machine-dependent rows masked with `mask_rect` so the
+    shape is assertable on any runner.
+  - `tests/termlens_cli.rs` — `termlens inspect` driving the real binary and
+    reproducing the committed goldens byte for byte, and `termlens
+    diff`/`render` reading those goldens, so they stay the interchange
+    format a bug report needs. `#[ignore]`d: a published crate must not
+    `cargo install` behind a contributor's back; `stress.yml` runs them.
+  - Both 100-iteration stresses now compare with `Screen::diff` instead of
+    two normalized strings — stronger (it sees styles and the cursor) and
+    readable when it fails (only the rows that moved, with a marker under
+    each changed column).
+  - CI writes `TERMLENS_ARTIFACT_DIR` and renders what a failure left behind
+    into the job summary; a new `skill-version` job fails when the vendored
+    agent skill drifts from the dependency.
+
 ## [0.4.0] — 2026-09-06
 
 The audit milestone (#33–#40): what the framework claimed, checked against
