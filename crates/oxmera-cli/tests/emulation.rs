@@ -38,16 +38,13 @@ fn fixture(name: &str) -> PathBuf {
 /// *might* change a cell, and would need reading before the goldens are
 /// trusted again.
 ///
-/// It is **not** the known termlens false positive (termlens#320), which
-/// reports `^[[5m`/`^[[25m`/`^[[9m`/`^[[29m` — blink and strikethrough —
-/// as unsupported although the attribute shadow does implement them. Those
-/// cannot appear here: the dashboard sets neither attribute on any cell, as
-/// `tests/styles.rs` pins by enumerating every distinct style it draws.
+/// There is no longer a known false positive to rule out. termlens#320 —
+/// `^[[5m`/`^[[25m`/`^[[9m`/`^[[29m`, blink and strikethrough, reported
+/// unsupported although the attribute shadow does implement them — was
+/// fixed in termlens 0.10.2, so an entry here is a real gap in every case.
+/// (The dashboard sets neither attribute anyway, as `tests/styles.rs` pins
+/// by enumerating every distinct style it draws.)
 const DASHBOARD_UNSUPPORTED: [&str; 1] = ["^[[59m"];
-
-fn unsupported(screen: &Screen) -> Vec<String> {
-    screen.unsupported().iter().map(|s| s.to_string()).collect()
-}
 
 /// The dashboard, painted and settled, at a given geometry.
 fn dashboard(cols: u16, rows: u16) -> termlens::Result<(Terminal, Screen)> {
@@ -84,18 +81,17 @@ fn the_emulator_drops_nothing_that_could_change_a_cell() -> termlens::Result<()>
     // The dashboard: ratatui's style resets, and nothing else.
     for (cols, rows) in [(100, 45), (80, 30)] {
         let (mut t, screen) = dashboard(cols, rows)?;
+        // One comparison for both halves of the record: termlens 0.11's
+        // `Unsupported` view is equal to a slice only when the retained
+        // shapes match *and* nothing overflowed the bound, so a truncated
+        // record fails here rather than passing as a shorter list.
         assert_eq!(
-            unsupported(&screen),
+            screen.unsupported(),
             DASHBOARD_UNSUPPORTED,
             "dashboard at {cols}x{rows}: oxmera emitted a sequence termlens \
-             does not model. Until it is understood, every screen assertion \
-             in this crate — the goldens included — is being made against a \
-             grid that may be wrong.\n{screen}"
-        );
-        assert_eq!(
-            screen.unsupported_overflow(),
-            0,
-            "dashboard at {cols}x{rows}: the record is complete, not truncated"
+             does not model, or the record was truncated. Until it is \
+             understood, every screen assertion in this crate — the goldens \
+             included — is being made against a grid that may be wrong.\n{screen}"
         );
         t.send(termlens::Key::Char('q'))?;
         t.wait_exit()?;
@@ -109,12 +105,11 @@ fn the_emulator_drops_nothing_that_could_change_a_cell() -> termlens::Result<()>
         for (cols, rows) in [(100, 45), (80, 45)] {
             let screen = report(name, cols, rows)?;
             assert!(
-                unsupported(&screen).is_empty(),
+                screen.unsupported().is_empty(),
                 "doctor {name} at {cols}x{rows}: the report is supposed to be \
                  plain text, but termlens dropped {:?}",
-                unsupported(&screen)
+                screen.unsupported()
             );
-            assert_eq!(screen.unsupported_overflow(), 0);
             let styled = (0..screen.rows())
                 .flat_map(|r| (0..screen.cols()).map(move |c| (r, c)))
                 .filter(|(r, c)| {

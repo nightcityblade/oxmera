@@ -273,13 +273,20 @@ fn inspect_drives_oxmera_and_gets_the_committed_picture() {
         String::from_utf8_lossy(&out.stderr)
     );
     let printed = String::from_utf8_lossy(&out.stdout);
+    // The trailer reports the program's own exit, on **stderr** since
+    // termlens 0.11 (termlens#340) — so stdout is the screen alone and
+    // needs no separating here.
     assert!(
-        printed.contains("--- exited: exit code 0 ---"),
-        "the trailer reports the program's own exit:\n{printed}"
+        String::from_utf8_lossy(&out.stderr).contains("--- exited: exit code 0 ---"),
+        "the trailer reports the program's own exit: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !printed.contains("--- "),
+        "stdout is a saved screen:\n{printed}"
     );
 
-    // The trailer is not part of the screen, so the grid is the header plus
-    // exactly `rows` lines. Saved on its own it is a screen `diff` reads.
+    // The header plus exactly `rows` lines, which is what `diff` reads.
     let grid: String = printed
         .lines()
         .take(46)
@@ -327,9 +334,14 @@ fn inspect_drives_oxmera_and_gets_the_committed_picture() {
     );
     let printed = String::from_utf8_lossy(&out.stdout);
     assert!(
-        printed.contains("still running at the deadline"),
+        String::from_utf8_lossy(&out.stderr).contains("still running at the deadline"),
         "a TUI holds the terminal, so inspect reports the deadline rather \
-         than an exit:\n{printed}"
+         than an exit, on stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !printed.contains("--- "),
+        "stdout is a saved screen:\n{printed}"
     );
     let grid: String = printed
         .lines()
