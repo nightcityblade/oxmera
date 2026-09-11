@@ -48,12 +48,28 @@ jobs:
               echo "::error::$sha contains the robot emoji"; fail=1
             fi
             # DCO: the trailer must match the author. One documented
-            # equivalence: GitHub's squash/rebase merges rewrite the author
-            # email to <id>+<login>@users.noreply.github.com while the
-            # trailer keeps the real address — same person, so a trailer
-            # matching the author NAME satisfies the rule there.
+            # equivalence, and it runs in **both** directions: GitHub's
+            # squash/rebase merges rewrite the author email, pairing an
+            # account's real address with its
+            # <id>+<login>@users.noreply.github.com form. Which of the two
+            # lands in the author field is GitHub's choice and has changed:
+            # every merge on this branch before e1ceae0 was authored as the
+            # noreply address with a real address in the trailer, and
+            # e1ceae0 is the same person the other way round. The rule the
+            # original comment states — same person, so a trailer matching
+            # the author NAME satisfies it — covers both; only the test
+            # assumed one side.
+            #
+            # So the exemption asks whether *either* address is a GitHub
+            # noreply form, which is the signature of a rewrite, and then
+            # requires the names to be equal. A commit with neither form
+            # still needs an exact email match, which is every commit made
+            # on a branch by a human.
+            trailer_email=$(printf '%s' "$body" | sed -n 's/^Signed-off-by: .*<\(.*\)>$/\1/p' | head -1)
+            noreply='^[0-9]+\+.*@users\.noreply\.github\.com$'
             if ! printf '%s' "$body" | grep -q "Signed-off-by:.*<$author_email>"; then
-              if printf '%s' "$author_email" | grep -qE '^[0-9]+\+.*@users\.noreply\.github\.com$' \
+              if { printf '%s' "$author_email" | grep -qE "$noreply" \
+                   || printf '%s' "$trailer_email" | grep -qE "$noreply"; } \
                  && printf '%s' "$body" | grep -q "Signed-off-by: $author_name <"; then
                 :
               else
