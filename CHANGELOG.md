@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **termlens 0.10.1 → 0.11**, with the vendored skill and the report
+  action's `cli-version:` pins in `ci.yml` and `stress.yml`
+  (`check-skill-version.sh` holds all three equal to the dependency). 0.11
+  is termlens's stability candidate: from it no promised item changes
+  incompatibly before its 1.0, so this requirement should hold for a while.
+
+  Its one breaking change lands here as a simplification.
+  `Screen::unsupported()` returns a view instead of a slice of `Arc<str>`,
+  and `unsupported_overflow()` folds into it — so the dashboard's pinned
+  list and "the record is not truncated" are one assertion in
+  `tests/emulation.rs`, and `doctor`'s "the report is plain text" is one
+  call rather than two, because the view is non-empty when shapes
+  overflowed as well as when any were retained. The `Vec<String>` helper
+  that existed to make the comparison typecheck is gone.
+
+  The pin's known-defect caveat goes with it: termlens#320, which named
+  blink and strikethrough as unsupported although the attribute shadow
+  implements them, was fixed upstream in 0.10.2.
+
 - **termlens 0.9.0 → 0.10.1**, with the `serde` feature, and the terminal
   suite grown into the surface it opens. No call site broke: the crate never
   used `drag`, a `termlens::Style` literal, `assert_screen_snapshot!` or a
